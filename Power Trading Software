@@ -1,0 +1,205 @@
+from typing import List, Optional
+from sqlalchemy import create_engine, Column, String, Float, Integer
+from sqlalchemy.orm import declarative_base, sessionmaker
+from fastapi import FastAPI, Depends, HTTPException, status
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+
+# SQLAlchemy setup
+DATABASE_URL = "postgresql://postgres:password@localhost:5432/power_trading"
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
+Base = declarative_base()
+
+# FastAPI setup
+app = FastAPI()
+
+# JWT config
+SECRET_KEY = "your_secret_key"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# Database models
+class Seller(Base):
+    __tablename__ = 'sellers'
+    id = Column(String, primary_key=True)
+    quantity = Column(Float)
+    price_per_unit = Column(Float)
+
+class Buyer(Base):
+    __tablename__ = 'buyers'
+    id = Column(String, primary_key=True)
+    quantity = Column(Float)
+    max_price_per_unit = Column(Float)
+
+class Trade(Base):
+    __tablename__ = 'trades'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    buyer_id = Column(String)
+    seller_id = Column(String)
+    quantity = Column(Float)
+    price = Column(Float)
+
+class User(Base):
+    __tablename__ = 'users'
+    username = Column(String, primary_key=True)
+    hashed_password = Column(String)
+
+# Create tables
+Base.metadata.create_all(engine)
+
+# Pydantic models
+class SellerInput(BaseModel):
+    id: str
+    quantity: float
+    price_per_unit: float
+
+class BuyerInput(BaseModel):
+    id: str
+    quantity: float
+    max_price_per_unit: float
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+# Helper functions
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    session = Session()
+    user = session.query(User).filter(User.username == username).first()
+    session.close()
+    if user is None:
+        raise credentials_exception
+    return user
+
+# Auth endpoints
+@app.post("/register")
+def register(user: UserCreate):
+    session = Session()
+    db_user = session.query(User).filter(User.username == user.username).first()
+    if db_user:
+        session.close()
+        raise HTTPException(status_code=400, detail="Username already registered")
+    hashed_password = get_password_hash(user.password)
+    new_user = User(username=user.username, hashed_password=hashed_password)
+    session.add(new_user)
+    session.commit()
+    session.close()
+    return {"message": "User registered successfully"}
+
+@app.post("/token", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    session = Session()
+    user = session.query(User).filter(User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        session.close()
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    session.close()
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Protected endpoints
+@app.post("/add_seller")
+def add_seller(seller_input: SellerInput, user: User = Depends(get_current_user)):
+    session = Session()
+    seller = Seller(**seller_input.dict())
+    session.add(seller)
+    session.commit()
+    session.close()
+    return {"message": "Seller added successfully"}
+
+@app.post("/add_buyer")
+def add_buyer(buyer_input: BuyerInput, user: User = Depends(get_current_user)):
+    session = Session()
+    buyer = Buyer(**buyer_input.dict())
+    session.add(buyer)
+    session.commit()
+    session.close()
+    return {"message": "Buyer added successfully"}
+
+@app.post("/match")
+def match(user: User = Depends(get_current_user)):
+    session = Session()
+    buyers = session.query(Buyer).all()
+    sellers = session.query(Seller).all()
+    trades = match_orders(buyers, sellers, session)
+    result = [trade.__repr__() for trade in trades]
+    session.close()
+    return JSONResponse(content={"trades": result})
+
+@app.get("/trades")
+def get_trades(user: User = Depends(get_current_user)):
+    session = Session()
+    trades = session.query(Trade).all()
+    result = [trade.__repr__() for trade in trades]
+    session.close()
+    return {"trades": result}
+
+# Matching logic
+
+def match_orders(buyers: List[Buyer], sellers: List[Seller], session) -> List[Trade]:
+    trades = []
+    buyers.sort(key=lambda b: b.max_price_per_unit, reverse=True)
+    sellers.sort(key=lambda s: s.price_per_unit)
+    for buyer in buyers:
+        for seller in sellers:
+            if buyer.quantity == 0:
+                break
+            if seller.quantity == 0:
+                continue
+            if seller.price_per_unit <= buyer.max_price_per_unit:
+                trade_qty = min(buyer.quantity, seller.quantity)
+                trade = Trade(
+                    buyer_id=buyer.id,
+                    seller_id=seller.id,
+                    quantity=trade_qty,
+                    price=seller.price_per_unit
+                )
+                trades.append(trade)
+                session.add(trade)
+                buyer.quantity -= trade_qty
+                seller.quantity -= trade_qty
+    session.commit()
+    return trades
